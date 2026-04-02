@@ -1,4 +1,4 @@
-# league-connect-rust
+# league-connect-rs
 
 Rust client for the **League of Legends Client Update (LCU) API**.
 
