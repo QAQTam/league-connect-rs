@@ -151,7 +151,7 @@ This library was written with AI assistance. The code, architecture, documentati
 
 All in AI. All love AI.
 
-The library was extracted from [lol-bp-ui-rs](https://github.com/QAQTam/league-banpickUI-rs), a Tauri rewrite of an Electron-based League of Legends broadcast tool. Human direction and vision by [@QAQTam](https://github.com/QAQTam).
+The library was extracted from [league-banpickUI-overlay-rs](https://github.com/QAQTam/league-banpickUI-overlay-rs), a Tauri rewrite of an Electron-based League of Legends broadcast tool. Human direction and vision by [@QAQTam](https://github.com/QAQTam).
 
 ---
 
