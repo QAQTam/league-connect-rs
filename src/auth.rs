@@ -2,42 +2,51 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 
-/// 对应 JS Credentials 接口
+/// LCU API credentials extracted from the running League Client process.
+///
+/// The League Client passes `--app-port` and `--remoting-auth-token` as
+/// command-line arguments. This struct holds those values along with the
+/// system PID, and provides helpers to build auth headers and base URLs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
+    /// The local port the LCU API is listening on
     pub port: u16,
+    /// The auth token for HTTP Basic authentication (username is always `riot`)
     pub password: String,
+    /// System process ID of `LeagueClientUx`
     pub pid: u32,
 }
 
-/// 构建 Basic Auth header 值，供 HTTP 和 WebSocket 使用
-/// 对应 JS: Buffer.from(`riot:${password}`).toString('base64')
 impl Credentials {
+    /// Build the `Authorization: Basic ...` header value.
+    ///
+    /// The LCU API uses HTTP Basic Auth with username `riot` and the
+    /// remoting auth token as the password.
     pub fn basic_auth(&self) -> String {
         use base64::{engine::general_purpose, Engine as _};
         let raw = format!("riot:{}", self.password);
         format!("Basic {}", general_purpose::STANDARD.encode(raw))
     }
 
+    /// HTTPS base URL, e.g. `https://127.0.0.1:52437`
     pub fn lcu_base_url(&self) -> String {
         format!("https://127.0.0.1:{}", self.port)
     }
 
+    /// WSS URL for the LCU WebSocket, e.g. `wss://127.0.0.1:52437`
     pub fn lcu_ws_url(&self) -> String {
         format!("wss://127.0.0.1:{}", self.port)
     }
 }
 
-/// 尝试一次进程查找。
+/// Attempt to find a running `LeagueClientUx` process **once**.
 ///
-/// 对应 JS authenticate() 的核心逻辑：
-///   Get-CimInstance ... WHERE name LIKE 'LeagueClientUx.exe'
-///   + regex 提取 --app-port / --remoting-auth-token / --app-pid
+/// Returns `None` if the process is not found or if the command-line
+/// arguments haven't fully appeared yet (the process may still be starting).
 ///
-/// 返回 None 表示 LCU 未运行（而非 panic），调用方决定是否重试。
+/// Uses the `sysinfo` crate to enumerate processes directly through the OS
+/// kernel API — no shell subprocess is spawned.
 pub fn try_find_lcu() -> Option<Credentials> {
-    // 只刷新进程命令行，减少内存和 CPU 开销
-    // sysinfo 0.32 API: refresh_processes_specifics 需要明确 UpdateKind
     let mut sys = System::new();
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
@@ -45,19 +54,15 @@ pub fn try_find_lcu() -> Option<Credentials> {
         ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
     );
 
-    // 预编译正则（实际使用时应放到 lazy_static/OnceLock 中）
     let port_re = Regex::new(r"--app-port=(\d+)").unwrap();
     let pass_re = Regex::new(r"--remoting-auth-token=([\w-]+)").unwrap();
 
     for (pid, process) in sys.processes() {
-        // process.name() 在 Windows 上返回不含路径的可执行文件名
         let name = process.name().to_string_lossy();
         if !name.contains("LeagueClientUx") {
             continue;
         }
 
-        // cmd() 返回 &[OsString]，每个元素是一个参数
-        // 拼成一个字符串方便统一 regex 匹配
         let cmdline: String = process
             .cmd()
             .iter()
@@ -65,7 +70,6 @@ pub fn try_find_lcu() -> Option<Credentials> {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // 任一字段缺失则跳过（进程可能正在启动中，参数还不完整）
         let port: u16 = port_re
             .captures(&cmdline)?
             .get(1)?
@@ -89,9 +93,17 @@ pub fn try_find_lcu() -> Option<Credentials> {
     None
 }
 
-/// 轮询直到找到 LCU，对应 JS authenticate({ awaitConnection: true })
+/// Poll until a running League Client is found.
 ///
-/// 永不返回 Err，找到即 return。
+/// Calls [`try_find_lcu`] in a loop, sleeping `poll_interval_ms` between
+/// attempts. Never returns `Err` — it simply waits.
+///
+/// ```no_run
+/// # async fn example() {
+/// let creds = league_connect_rust::authenticate(3000).await; // poll every 3 s
+/// println!("LCU found on port {}", creds.port);
+/// # }
+/// ```
 pub async fn authenticate(poll_interval_ms: u64) -> Credentials {
     loop {
         if let Some(creds) = try_find_lcu() {
@@ -105,8 +117,6 @@ pub async fn authenticate(poll_interval_ms: u64) -> Credentials {
 mod tests {
     use super::*;
 
-    /// cargo test -- --nocapture
-    /// 需要 LeagueClientUx.exe 正在运行
     #[test]
     fn test_find_lcu_running() {
         match try_find_lcu() {
@@ -114,9 +124,7 @@ mod tests {
                 println!("Found LCU:");
                 println!("  PID:      {}", creds.pid);
                 println!("  Port:     {}", creds.port);
-                println!("  Password: {}", creds.password);
                 println!("  Auth:     {}", creds.basic_auth());
-                println!("  WS URL:   {}", creds.lcu_ws_url());
                 assert!(creds.port > 0);
                 assert!(!creds.password.is_empty());
             }

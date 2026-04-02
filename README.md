@@ -1,90 +1,86 @@
 # league-connect-rust
 
-Rust port of [league-connect](https://github.com/matsjla/league-connect) — a client library for the **League of Legends Client Update (LCU) API**.
+Rust client for the **League of Legends Client Update (LCU) API**.
 
-Provides three capabilities that directly mirror the original Node.js library:
+A Rust port of [league-connect](https://github.com/matsjla/league-connect) (Node.js), providing:
+
+- **Process discovery** — find the running League Client and extract API credentials
+- **REST client** — `GET` / `POST` / `PUT` / `DELETE` / `PATCH` any LCU endpoint
+- **WebSocket (WAMP)** — subscribe to all real-time LCU events via `tokio::sync::mpsc`
 
 | Feature | JS original | Rust implementation |
 |---|---|---|
-| Process discovery | PowerShell `Get-CimInstance` | `sysinfo` crate (direct syscall) |
-| LCU REST requests | `https.request` + `rejectUnauthorized: false` | `reqwest` + `native-tls` |
-| LCU WebSocket (WAMP) | `ws` + `[5, "OnJsonApiEvent"]` | `tokio-tungstenite` + `mpsc` channel |
-
-> **Windows only** — the LCU runs on Windows (and macOS/Linux for the standalone client), but this library currently targets Windows process discovery. The HTTP and WebSocket modules are cross-platform.
+| Process discovery | PowerShell `Get-CimInstance` (~200-400ms) | `sysinfo` crate — direct kernel API (~10ms) |
+| REST requests | `https.request` + `rejectUnauthorized: false` | `reqwest` + `native-tls` |
+| WebSocket | `ws` + callback Map | `tokio-tungstenite` + `mpsc` channel |
 
 ---
 
-## Usage
-
-Add to your `Cargo.toml`:
+## Quick Start
 
 ```toml
 [dependencies]
-league-connect-rust = { path = "../league-connect-rust" }
+league-connect-rust = { git = "https://github.com/QAQTam/league-connect-rust" }
 tokio = { version = "1", features = ["full"] }
 ```
 
-### 1 — Process discovery
+### Process Discovery
 
 ```rust
 use league_connect_rust::{try_find_lcu, authenticate};
 
 // One-shot: returns None if LCU is not running
 if let Some(creds) = try_find_lcu() {
-    println!("port={} password={}", creds.port, creds.password);
+    println!("port={} pid={}", creds.port, creds.pid);
 }
 
-// Blocking poll: waits until LCU launches (like awaitConnection: true)
-let creds = authenticate(3000).await; // poll every 3 s
+// Poll until LCU launches
+let creds = authenticate(3000).await; // check every 3s
 ```
 
-### 2 — REST requests
+### REST API
 
 ```rust
-use league_connect_rust::{authenticate, build_lcu_client, lcu_get, parse_marketing_version};
+use league_connect_rust::{authenticate, build_lcu_client, lcu_get, lcu_post};
 
 let creds  = authenticate(3000).await;
-let client = build_lcu_client(); // reuse — it manages a connection pool
+let client = build_lcu_client(); // reuse — maintains connection pool
 
-// Any LCU endpoint; returns serde_json::Value or None on error/404
-let ver = lcu_get(&client, &creds, "/lol-patch/v1/game-version").await;
-if let Some(raw) = ver.and_then(|v| v.as_str().map(String::from)) {
-    println!("patch {}", parse_marketing_version(&raw).unwrap()); // e.g. "14.21"
-}
+// GET any LCU endpoint
+let me = lcu_get(&client, &creds, "/lol-summoner/v1/current-summoner").await;
 
-let session = lcu_get(&client, &creds, "/lol-gameflow/v1/session").await;
-let phase   = session.as_ref().and_then(|v| v["phase"].as_str());
+// POST with JSON body
+let body = serde_json::json!({ "queueId": 420 });
+lcu_post(&client, &creds, "/lol-lobby/v2/lobby", &body).await;
 ```
 
-### 3 — WebSocket event subscription
+Available: `lcu_get`, `lcu_post`, `lcu_put`, `lcu_delete`, `lcu_patch`, and the generic `lcu_request` for full control.
+
+### WebSocket Events
 
 ```rust
 use league_connect_rust::{authenticate, connect, EventType};
 
 let creds = authenticate(3000).await;
-let mut rx = connect(&creds, 64).await?; // 64 = channel buffer size
+let mut rx = connect(&creds, 128).await?;
 
 while let Some(event) = rx.recv().await {
-    // event: LcuEvent { uri, event_type, data }
-    match event.uri.as_str() {
-        "/lol-champ-select/v1/session" => {
-            if event.event_type == EventType::Delete {
-                println!("session ended");
-            } else {
-                println!("phase: {}", event.data["timer"]["phase"]);
-            }
-        }
-        _ => {}
-    }
+    // event.uri       — e.g. "/lol-gameflow/v1/session"
+    // event.event_type — Create, Update, Delete
+    // event.data       — serde_json::Value
+    println!("[{:?}] {}", event.event_type, event.uri);
 }
-// rx.recv() returns None when the LCU WebSocket closes
+// rx.recv() returns None when LCU disconnects
 ```
 
-### Run the demo
+### Run the Examples
 
 ```bash
-# Start League Client first, then:
+# WebSocket event monitor — prints ALL LCU events
 cargo run --example connect
+
+# REST API demo — summoner info, game version, gameflow phase
+cargo run --example rest
 ```
 
 ---
@@ -93,81 +89,69 @@ cargo run --example connect
 
 ### `auth` module
 
-```rust
-pub struct Credentials {
-    pub port:     u16,
-    pub password: String,
-    pub pid:      u32,
-}
+| Function | Description |
+|---|---|
+| `try_find_lcu() -> Option<Credentials>` | One-shot process scan |
+| `authenticate(poll_ms) -> Credentials` | Poll until LCU is found |
 
-impl Credentials {
-    pub fn basic_auth(&self)   -> String  // "Basic <base64>"
-    pub fn lcu_base_url(&self) -> String  // "https://127.0.0.1:{port}"
-    pub fn lcu_ws_url(&self)   -> String  // "wss://127.0.0.1:{port}"
-}
-
-pub fn  try_find_lcu()                     -> Option<Credentials>
-pub async fn authenticate(poll_ms: u64)    -> Credentials
-```
+`Credentials` provides: `basic_auth()`, `lcu_base_url()`, `lcu_ws_url()`
 
 ### `http` module
 
-```rust
-pub fn  build_lcu_client()                                      -> reqwest::Client
-pub async fn lcu_get(client, creds, endpoint) -> Option<Value>
-pub fn  parse_marketing_version(raw: &str)    -> Option<String>
-```
+| Function | Description |
+|---|---|
+| `build_lcu_client() -> Client` | Reusable HTTP client (skips self-signed cert verification) |
+| `lcu_request(client, creds, method, endpoint, body)` | Generic request |
+| `lcu_get` / `lcu_post` / `lcu_put` / `lcu_delete` / `lcu_patch` | Convenience wrappers |
+| `parse_marketing_version(raw) -> Option<String>` | `"4.21.614.6789"` -> `"14.21"` |
 
 ### `websocket` module
 
-```rust
-pub struct LcuEvent {
-    pub uri:        String,
-    pub event_type: EventType,
-    pub data:       serde_json::Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EventType { Create, Update, Delete, Unknown }
-
-pub async fn connect(creds: &Credentials, buffer: usize)
-    -> Result<mpsc::Receiver<LcuEvent>, Box<dyn Error + Send + Sync>>
-```
+| Function / Type | Description |
+|---|---|
+| `connect(creds, buffer) -> Result<Receiver<LcuEvent>>` | Subscribe to all LCU events |
+| `LcuEvent { uri, event_type, data }` | A single event |
+| `EventType { Create, Update, Delete, Unknown }` | Event classification |
 
 ---
 
-## Design notes
+## Design Notes
 
 ### Why `sysinfo` instead of PowerShell?
 
-The JS library spawns a PowerShell child process (`Get-CimInstance`) on every `authenticate()` call — roughly 200–400 ms of overhead. `sysinfo` queries the Windows kernel directly (`NtQuerySystemInformation`), taking < 10 ms.
+The JS library spawns a PowerShell child process on every poll — ~200-400ms overhead. `sysinfo` queries `NtQuerySystemInformation` directly, taking <10ms.
 
 ### Why `mpsc` channel instead of callbacks?
 
-The JS `LeagueWebSocket` uses a `Map<uri, callbacks[]>`. The idiomatic Rust equivalent is an `mpsc` channel:
-
 ```
-tokio task (owns WS stream)
-    └── tx.send(event) ──channel──► caller: while let Some(e) = rx.recv().await
+tokio task (owns WebSocket)
+    └── tx.send(event) ──channel──► caller: rx.recv().await
 ```
 
-When the LCU disconnects, the task drops `tx`, and `rx.recv()` returns `None` — the caller naturally knows to reconnect without needing a separate signal.
+When the LCU disconnects, the task drops `tx`, and `rx.recv()` returns `None` — the caller naturally knows the connection is gone. No separate close signals, no callback cleanup.
 
-### WAMP protocol
+### WAMP Protocol
 
-The LCU WebSocket uses a simplified subset of [WAMP](https://wamp-proto.org/):
+The LCU uses a simplified WAMP subset:
 
 ```
-Client → Server:  [5, "OnJsonApiEvent"]        // Subscribe (opcode 5)
-Server → Client:  [8, "OnJsonApiEvent", {...}] // Event     (opcode 8)
+Client → Server:  [5, "OnJsonApiEvent"]          // Subscribe
+Server → Client:  [8, "OnJsonApiEvent", {payload}] // Event
                                   └── { uri, data, eventType }
 ```
 
 ---
 
-## Relation to the original JS library
+## AI Authorship
 
-This library was extracted from [lol-bp-ui-rs](https://github.com/QAQTam/lol-bp-ui-rs), a Tauri rewrite of an Electron-based League of Legends tournament broadcast tool. The LCU connection logic was ported from the JS `league-connect` library source as part of that migration.
+This library was written with AI assistance. The code, architecture, documentation, and examples were authored collaboratively by:
+
+- **[Claude](https://claude.ai)** (Anthropic) — primary code author
+- **[Gemini](https://gemini.google.com)** (Google) — contributed to the original project
+
+All in AI. All love AI.
+
+The library was extracted from [lol-bp-ui-rs](https://github.com/QAQTam/lol-bp-ui-rs), a Tauri rewrite of an Electron-based League of Legends broadcast tool. Human direction and vision by [@QAQTam](https://github.com/QAQTam).
 
 ---
 

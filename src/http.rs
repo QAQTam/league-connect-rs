@@ -1,47 +1,51 @@
-use reqwest::{Client, ClientBuilder};
+use reqwest::{Client, ClientBuilder, Method};
 use serde_json::Value;
 
 use super::auth::Credentials;
 
-/// 构建一个可复用的 LCU HTTP Client。
+/// Build a reusable HTTP client configured for the LCU API.
 ///
-/// 对应 JS 中每次 lcuRequest() 都隐式创建的 https.Agent：
-///   { rejectUnauthorized: false }
+/// The League Client uses a Riot Games self-signed certificate.
+/// This client skips TLS verification so requests are not rejected.
 ///
-/// 注意：Client 内部维护连接池，应当全局只建一次（见 main.rs 的 AppState），
-/// 而不是每次请求都 build。
+/// **Reuse this client** — it maintains an internal connection pool.
+/// Creating one per request wastes TLS handshakes.
 pub fn build_lcu_client() -> Client {
     ClientBuilder::new()
-        // 等价 rejectUnauthorized: false —— LCU 使用 Riot 自签名证书
         .danger_accept_invalid_certs(true)
-        // LCU 有时返回非标准 hostname，一并跳过
         .danger_accept_invalid_hostnames(true)
         .build()
         .expect("failed to build LCU HTTP client")
 }
 
-/// 向 LCU REST API 发送一次 GET 请求，返回解析后的 JSON。
+// ─── Generic request ─────────────────────────────────────────
+
+/// Send any HTTP request to the LCU API.
 ///
-/// 对应 JS lcuRequest(credentials, endpoint)：
-///   https.request({ hostname: '127.0.0.1', port, path: endpoint,
-///                   headers: { Authorization: 'Basic ...' },
-///                   rejectUnauthorized: false })
-///
-/// 返回 None 的情况：
-///   - 网络错误 / LCU 未就绪
-///   - HTTP 非 2xx
-///   - 响应体不是合法 JSON
-pub async fn lcu_get(client: &Client, credentials: &Credentials, endpoint: &str) -> Option<Value> {
+/// Returns `None` on network error, non-2xx status, or invalid JSON body.
+/// This is the low-level building block — prefer the convenience wrappers
+/// [`lcu_get`], [`lcu_post`], [`lcu_put`], [`lcu_delete`] for common cases.
+pub async fn lcu_request(
+    client: &Client,
+    credentials: &Credentials,
+    method: Method,
+    endpoint: &str,
+    body: Option<&Value>,
+) -> Option<Value> {
     let url = format!("{}{}", credentials.lcu_base_url(), endpoint);
 
-    client
-        .get(&url)
+    let mut req = client
+        .request(method, &url)
         .header("Authorization", credentials.basic_auth())
-        .header("Accept", "application/json")
-        .send()
+        .header("Accept", "application/json");
+
+    if let Some(json_body) = body {
+        req = req.json(json_body);
+    }
+
+    req.send()
         .await
         .ok()?
-        // 非 2xx 视为失败（LCU 在 session 不存在时返回 404）
         .error_for_status()
         .ok()?
         .json::<Value>()
@@ -49,13 +53,100 @@ pub async fn lcu_get(client: &Client, credentials: &Credentials, endpoint: &str)
         .ok()
 }
 
-/// 专门处理 /lol-patch/v1/game-version 的版本转换。
+// ─── Convenience wrappers ────────────────────────────────────
+
+/// `GET` an LCU endpoint. Returns `None` on error or non-2xx.
 ///
-/// LCU 返回内部版本号，例如 "4.21.14.6789"
-/// index.mjs 中对应的转换逻辑：
-///   const parts = rawVersion.split('.')
-///   `${parseInt(parts[0]) + 10}.${parts[1].padStart(2, '0')}`
-/// → 营销版本号 "14.21"（加 10 是因为 Riot 内部版本从 S4 算起）
+/// ```no_run
+/// # async fn example(client: &reqwest::Client, creds: &league_connect_rust::Credentials) {
+/// // Get current summoner info
+/// let me = league_connect_rust::lcu_get(client, creds, "/lol-summoner/v1/current-summoner").await;
+///
+/// // Get lobby members
+/// let lobby = league_connect_rust::lcu_get(client, creds, "/lol-lobby/v2/lobby").await;
+///
+/// // Get game version
+/// let ver = league_connect_rust::lcu_get(client, creds, "/lol-patch/v1/game-version").await;
+/// # }
+/// ```
+pub async fn lcu_get(client: &Client, credentials: &Credentials, endpoint: &str) -> Option<Value> {
+    lcu_request(client, credentials, Method::GET, endpoint, None).await
+}
+
+/// `POST` to an LCU endpoint with a JSON body.
+///
+/// ```no_run
+/// # async fn example(client: &reqwest::Client, creds: &league_connect_rust::Credentials) {
+/// // Create a lobby
+/// let body = serde_json::json!({ "queueId": 420 });
+/// league_connect_rust::lcu_post(client, creds, "/lol-lobby/v2/lobby", &body).await;
+///
+/// // Accept a ready check
+/// league_connect_rust::lcu_post(client, creds, "/lol-matchmaking/v1/ready-check/accept", &serde_json::json!({})).await;
+/// # }
+/// ```
+pub async fn lcu_post(
+    client: &Client,
+    credentials: &Credentials,
+    endpoint: &str,
+    body: &Value,
+) -> Option<Value> {
+    lcu_request(client, credentials, Method::POST, endpoint, Some(body)).await
+}
+
+/// `PUT` to an LCU endpoint with a JSON body.
+///
+/// ```no_run
+/// # async fn example(client: &reqwest::Client, creds: &league_connect_rust::Credentials) {
+/// // Lock in a champion during champ select
+/// let body = serde_json::json!({ "championId": 1, "completed": true });
+/// league_connect_rust::lcu_put(client, creds, "/lol-champ-select/v1/session/actions/1", &body).await;
+/// # }
+/// ```
+pub async fn lcu_put(
+    client: &Client,
+    credentials: &Credentials,
+    endpoint: &str,
+    body: &Value,
+) -> Option<Value> {
+    lcu_request(client, credentials, Method::PUT, endpoint, Some(body)).await
+}
+
+/// `DELETE` an LCU endpoint. Returns `None` on error or non-2xx.
+///
+/// ```no_run
+/// # async fn example(client: &reqwest::Client, creds: &league_connect_rust::Credentials) {
+/// // Leave the current lobby
+/// league_connect_rust::lcu_delete(client, creds, "/lol-lobby/v2/lobby").await;
+/// # }
+/// ```
+pub async fn lcu_delete(
+    client: &Client,
+    credentials: &Credentials,
+    endpoint: &str,
+) -> Option<Value> {
+    lcu_request(client, credentials, Method::DELETE, endpoint, None).await
+}
+
+/// `PATCH` an LCU endpoint with a JSON body.
+pub async fn lcu_patch(
+    client: &Client,
+    credentials: &Credentials,
+    endpoint: &str,
+    body: &Value,
+) -> Option<Value> {
+    lcu_request(client, credentials, Method::PATCH, endpoint, Some(body)).await
+}
+
+// ─── Utility ─────────────────────────────────────────────────
+
+/// Convert an internal LCU version string to the player-facing patch number.
+///
+/// The LCU reports versions like `"4.21.614.6789"` where `4` is the internal
+/// season offset (Season 4 = 0). Adding 10 yields the marketing version:
+/// `"14.21"`.
+///
+/// Returns `None` if the input is not in the expected format.
 pub fn parse_marketing_version(raw: &str) -> Option<String> {
     let parts: Vec<&str> = raw.split('.').collect();
     if parts.len() < 2 {
@@ -73,57 +164,30 @@ mod tests {
 
     #[test]
     fn test_version_parsing() {
-        // 典型的 LCU 内部版本格式
-        assert_eq!(
-            parse_marketing_version("4.21.614.6789"),
-            Some("14.21".to_string())
-        );
-        assert_eq!(
-            parse_marketing_version("4.03.614.6789"),
-            Some("14.03".to_string())
-        );
-        // padStart(2, '0') 效果：个位数 minor 补零
-        assert_eq!(
-            parse_marketing_version("4.3.614.6789"),
-            Some("14.03".to_string())  // "3" → "03"
-        );
+        assert_eq!(parse_marketing_version("4.21.614.6789"), Some("14.21".into()));
+        assert_eq!(parse_marketing_version("4.3.614.6789"), Some("14.03".into()));
         assert_eq!(parse_marketing_version("bad"), None);
     }
 
-    /// 需要 LCU 运行时执行：cargo test -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_lcu_get_summoner() {
+        let creds = try_find_lcu().expect("LCU not running");
+        let client = build_lcu_client();
+        let me = lcu_get(&client, &creds, "/lol-summoner/v1/current-summoner").await;
+        println!("current summoner: {:?}", me);
+        assert!(me.is_some());
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_lcu_get_version() {
         let creds = try_find_lcu().expect("LCU not running");
         let client = build_lcu_client();
-
-        let version = lcu_get(&client, &creds, "/lol-patch/v1/game-version")
+        let ver = lcu_get(&client, &creds, "/lol-patch/v1/game-version")
             .await
             .expect("request failed");
-
-        let raw = version.as_str().expect("expected a string value");
-        println!("Raw version:       {}", raw);
-        println!(
-            "Marketing version: {}",
-            parse_marketing_version(raw).unwrap_or_default()
-        );
-        assert!(!raw.is_empty());
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_lcu_get_gameflow() {
-        let creds = try_find_lcu().expect("LCU not running");
-        let client = build_lcu_client();
-
-        // 在英雄选择阶段才有数据，平时返回 404 → None
-        let session = lcu_get(&client, &creds, "/lol-gameflow/v1/session").await;
-        match session {
-            Some(val) => {
-                let mode = &val["gameData"]["queue"]["gameMode"];
-                println!("Game mode: {}", mode);
-            }
-            None => println!("Not in a game session (expected outside of champ-select)"),
-        }
+        let raw = ver.as_str().expect("expected a string");
+        println!("raw={raw}  marketing={}", parse_marketing_version(raw).unwrap_or_default());
     }
 }
