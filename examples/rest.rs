@@ -4,7 +4,7 @@
 //! (requires a running League Client)
 
 use league_connect_rust::{
-    authenticate, build_lcu_client, lcu_get, lcu_post, parse_marketing_version, try_find_lcu,
+    authenticate, build_lcu_client, lcu_get, parse_marketing_version, try_find_lcu,
 };
 
 #[tokio::main]
